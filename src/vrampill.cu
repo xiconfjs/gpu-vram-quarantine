@@ -70,13 +70,23 @@ __global__ void kfill(unsigned int* p, unsigned long long n,
     for (; i < n; i += stride) p[i] = genval(base + i, pat, mode);
 }
 
-// Per-chunk error flags live on the device so that a whole sweep costs one
-// host copy rather than one per chunk. With thousands of chunks that is the
-// difference between a usable search and an unusably slow one.
+#define NO_CAND 0xFFFFFFFFFFFFFFFFULL
+
+// Per-chunk state lives on the device so that a whole sweep costs one host copy
+// rather than one per chunk. With thousands of chunks that is the difference
+// between a usable search and an unusably slow one.
+//
+// The first error in a chunk nominates a candidate element index. Subsequent
+// errors either land on that same index (corroboration) or somewhere else in the
+// chunk (recorded separately). A chunk is only *confirmed* once the same element
+// has failed --confirm-hits times, which is what distinguishes a genuinely stuck
+// cell from a one-off transient. Credit to Olari-A for the requirement that
+// discovery and confirmation must agree on the same offset and bit.
 __global__ void kcheck(const unsigned int* p, unsigned long long n,
                        unsigned long long base, unsigned int pat, int mode,
                        int cidx, unsigned int* chunkhits,
-                       unsigned long long* chunkidx, unsigned int* chunkxor)
+                       unsigned long long* chunkidx, unsigned int* chunkxor,
+                       unsigned int* samehits, unsigned int* mismatch)
 {
     unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
     unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
@@ -84,8 +94,15 @@ __global__ void kcheck(const unsigned int* p, unsigned long long n,
         unsigned int want = genval(base + i, pat, mode);
         unsigned int got  = p[i];
         if (got != want) {
-            if (atomicAdd(&chunkhits[cidx], 1u) == 0u) chunkidx[cidx] = i;
-            atomicOr(&chunkxor[cidx], want ^ got);
+            atomicAdd(&chunkhits[cidx], 1u);
+            unsigned long long prev =
+                atomicCAS((unsigned long long*)&chunkidx[cidx], NO_CAND, i);
+            if (prev == NO_CAND || prev == i) {
+                atomicAdd(&samehits[cidx], 1u);
+                atomicOr(&chunkxor[cidx], want ^ got);
+            } else {
+                atomicAdd(&mismatch[cidx], 1u);
+            }
         }
     }
 }
@@ -108,6 +125,7 @@ int main(int argc, char** argv)
     double quiet_secs  = 180.0;    // stop once this long passes with nothing new
     int    max_bad     = 64;
     int    allow_clean = 0;
+    int    confirm_hits = 2;   // repeats at the same offset before "confirmed"
     const char* ready_file = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -116,6 +134,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--find-seconds") && i + 1 < argc) find_secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--quiet-seconds") && i + 1 < argc) quiet_secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max-bad") && i + 1 < argc) max_bad = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--confirm-hits") && i + 1 < argc) confirm_hits = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--allow-clean")) allow_clean = 1;
         else if (!strcmp(argv[i], "--ready-file") && i + 1 < argc) ready_file = argv[++i];
     }
@@ -143,7 +162,8 @@ int main(int argc, char** argv)
     static unsigned int*      chunk[MAXCHUNK];
     static unsigned long long celems[MAXCHUNK];
     static unsigned long long cbase[MAXCHUNK];
-    static unsigned char      isbad[MAXCHUNK];
+    static unsigned char      isbad[MAXCHUNK];   // confirmed: repeated at one offset
+    static unsigned char      seen[MAXCHUNK];    // errored at least once, maybe transient
     int    nchunk = 0;
     size_t got_total = 0;
 
@@ -158,6 +178,7 @@ int main(int argc, char** argv)
         celems[nchunk] = csize / 4ULL;
         cbase[nchunk]  = base;
         isbad[nchunk]  = 0;
+        seen[nchunk]   = 0;
         base      += celems[nchunk];
         got_total += csize;
         nchunk++;
@@ -177,20 +198,29 @@ int main(int argc, char** argv)
     printf("\n");
     fflush(stdout);
 
-    unsigned int       *d_hits, *d_xor;
+    unsigned int       *d_hits, *d_xor, *d_same, *d_mism;
     unsigned long long *d_idx;
     CK(cudaMalloc(&d_hits, sizeof(unsigned int) * nchunk));
     CK(cudaMalloc(&d_xor,  sizeof(unsigned int) * nchunk));
+    CK(cudaMalloc(&d_same, sizeof(unsigned int) * nchunk));
+    CK(cudaMalloc(&d_mism, sizeof(unsigned int) * nchunk));
     CK(cudaMalloc(&d_idx,  sizeof(unsigned long long) * nchunk));
     CK(cudaMemset(d_hits, 0, sizeof(unsigned int) * nchunk));
     CK(cudaMemset(d_xor,  0, sizeof(unsigned int) * nchunk));
-    CK(cudaMemset(d_idx,  0, sizeof(unsigned long long) * nchunk));
+    CK(cudaMemset(d_same, 0, sizeof(unsigned int) * nchunk));
+    CK(cudaMemset(d_mism, 0, sizeof(unsigned int) * nchunk));
+    // 0xFF... = NO_CAND, i.e. no candidate offset nominated yet.
+    CK(cudaMemset(d_idx, 0xFF, sizeof(unsigned long long) * nchunk));
 
     unsigned int* h_hits = (unsigned int*)calloc(nchunk, sizeof(unsigned int));
     unsigned int* h_xor  = (unsigned int*)calloc(nchunk, sizeof(unsigned int));
+    unsigned int* h_same = (unsigned int*)calloc(nchunk, sizeof(unsigned int));
+    unsigned int* h_mism = (unsigned int*)calloc(nchunk, sizeof(unsigned int));
     unsigned long long* h_idx =
         (unsigned long long*)calloc(nchunk, sizeof(unsigned long long));
-    if (!h_hits || !h_xor || !h_idx) { printf("ABORT: host alloc failed\n"); return 2; }
+    if (!h_hits || !h_xor || !h_same || !h_mism || !h_idx) {
+        printf("ABORT: host alloc failed\n"); return 2;
+    }
 
     // Walking one and walking zero drive every bit position both high and low
     // at every address. A cell that only fails in one direction is invisible to
@@ -233,38 +263,68 @@ int main(int argc, char** argv)
 
         for (int c = 0; c < nchunk; c++)
             kcheck<<<blocks, threads>>>(chunk[c], celems[c], cbase[c], pat, mode,
-                                        c, d_hits, d_idx, d_xor);
+                                        c, d_hits, d_idx, d_xor, d_same, d_mism);
         CK(cudaDeviceSynchronize());
 
         CK(cudaMemcpy(h_hits, d_hits, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(h_same, d_same, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
         for (int c = 0; c < nchunk; c++) {
-            if (h_hits[c] && !isbad[c]) {
+            if (!h_hits[c]) continue;
+
+            // Announce a chunk the first time it errors at all, but do not treat
+            // it as confirmed until the same offset has failed repeatedly. One
+            // hit could be a transient rather than a stuck cell.
+            if (!seen[c]) {
+                seen[c] = 1;
+                CK(cudaMemcpy(h_idx, d_idx, sizeof(unsigned long long) * nchunk, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(h_xor, d_xor, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
+                unsigned long long off = (cbase[c] + h_idx[c]) * 4ULL;
+                printf("  [%.0fs] candidate: chunk %d, offset 0x%llX (%.2f GiB), xor 0x%08X"
+                       " — needs %d hits to confirm\n",
+                       now_s() - t0, c, off, off / 1073741824.0, h_xor[c], confirm_hits);
+                fflush(stdout);
+            }
+
+            if (!isbad[c] && (int)h_same[c] >= confirm_hits) {
                 isbad[c] = 1;
                 nbad++;
                 last_new = now_s();
                 CK(cudaMemcpy(h_idx, d_idx, sizeof(unsigned long long) * nchunk, cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(h_xor, d_xor, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
                 unsigned long long off = (cbase[c] + h_idx[c]) * 4ULL;
-                printf("  [%.0fs] BAD CELL #%d: chunk %d, offset 0x%llX (%.2f GiB), xor 0x%08X\n",
-                       now_s() - t0, nbad, c, off, off / 1073741824.0, h_xor[c]);
+                printf("  [%.0fs] CONFIRMED #%d: chunk %d, offset 0x%llX (%.2f GiB),"
+                       " xor 0x%08X, %u hits at that offset\n",
+                       now_s() - t0, nbad, c, off, off / 1073741824.0, h_xor[c], h_same[c]);
                 fflush(stdout);
                 if (nbad > max_bad) {
-                    printf("\nABORT: more than --max-bad (%d) failing chunks. This card is\n"
-                           "too damaged for quarantine to be sensible.\n", max_bad);
+                    printf("\nABORT: more than --max-bad (%d) confirmed failing chunks.\n"
+                           "This card is too damaged for quarantine to be sensible.\n", max_bad);
                     return 5;
                 }
             }
         }
         iter++;
         if ((iter % 500) == 0) {
-            printf("  [%.0fs] %u iters, %d bad chunk(s) so far\n", now_s() - t0, iter, nbad);
+            printf("  [%.0fs] %u iters, %d confirmed\n", now_s() - t0, iter, nbad);
             fflush(stdout);
         }
     }
 
     double searched = now_s() - t0;
 
-    if (nbad == 0) {
+    CK(cudaMemcpy(h_idx,  d_idx,  sizeof(unsigned long long) * nchunk, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_xor,  d_xor,  sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_same, d_same, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_mism, d_mism, sizeof(unsigned int) * nchunk, cudaMemcpyDeviceToHost));
+
+    int nseen = 0, nunconf = 0;
+    for (int c = 0; c < nchunk; c++) {
+        if (!seen[c]) continue;
+        nseen++;
+        if (!isbad[c]) nunconf++;
+    }
+
+    if (nseen == 0) {
         printf("\nNo fault found in %.0fs / %u iterations.\n", searched, iter);
         printf("\nThis is NOT a clean bill of health. It means nothing was quarantined.\n"
                "A temperature-gated fault can need several minutes of load to appear,\n"
@@ -282,34 +342,57 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    // Release everything except the chunks holding defects.
+    // Quarantine anything that ever errored, confirmed or not. Holding an extra
+    // 8 MiB costs nothing; releasing a chunk that turns out to be genuinely bad
+    // costs silent corruption. Confirmation governs what gets *reported* as
+    // established, not what gets held.
     size_t held = 0, freed = 0;
     for (int c = 0; c < nchunk; c++) {
-        if (isbad[c]) { held += celems[c] * 4ULL; continue; }
+        if (seen[c]) { held += celems[c] * 4ULL; continue; }
         cudaFree(chunk[c]);
         freed += celems[c] * 4ULL;
     }
     cudaFree(d_hits); cudaFree(d_xor); cudaFree(d_idx);
+    cudaFree(d_same); cudaFree(d_mism);
 
     size_t f2 = 0, t2 = 0;
     cudaMemGetInfo(&f2, &t2);
 
     printf("\n=== QUARANTINE ACTIVE ===\n");
     printf("searched     : %.0fs, %u iterations\n", searched, iter);
-    printf("bad chunks   : %d\n", nbad);
-    printf("held         : %.1f MiB\n", held / 1048576.0);
+    printf("confirmed    : %d chunk(s) (>= %d hits at one offset)\n", nbad, confirm_hits);
+    if (nunconf)
+        printf("unconfirmed  : %d chunk(s) errored but never repeated — held anyway\n", nunconf);
+    printf("held         : %.1f MiB across %d chunk(s)\n", held / 1048576.0, nseen);
     printf("released     : %.2f GiB\n", freed / 1073741824.0);
     printf("free now     : %.2f GiB\n", f2 / 1073741824.0);
+
+    printf("\n%-8s %-20s %-12s %-8s %-9s %s\n",
+           "chunk", "offset", "xor", "hits", "elsewhere", "state");
+    for (int c = 0; c < nchunk; c++) {
+        if (!seen[c]) continue;
+        printf("%-8d 0x%016llX  0x%08X   %-8u %-9u %s\n",
+               c, (unsigned long long)((cbase[c] + h_idx[c]) * 4ULL), h_xor[c],
+               h_same[c], h_mism[c], isbad[c] ? "CONFIRMED" : "unconfirmed");
+    }
+    if (nunconf)
+        printf("\nUnconfirmed chunks errored once and never again at the same offset.\n"
+               "That may be a transient rather than a stuck cell. They are quarantined\n"
+               "regardless, but a longer run would settle it.\n");
 
     if (ready_file) {
         FILE* f = fopen(ready_file, "w");
         if (f) {
-            fprintf(f, "status=active\ndevice=%d\nchunk_mib=%zu\nbad_chunks=%d\nheld_mib=%.1f\n",
-                    dev, chunk_mib, nbad, held / 1048576.0);
+            fprintf(f, "status=active\ndevice=%d\nchunk_mib=%zu\n"
+                       "confirmed_chunks=%d\nunconfirmed_chunks=%d\nheld_chunks=%d\n"
+                       "held_mib=%.1f\nconfirm_hits=%d\n",
+                    dev, chunk_mib, nbad, nunconf, nseen,
+                    held / 1048576.0, confirm_hits);
             for (int c = 0; c < nchunk; c++)
-                if (isbad[c])
-                    fprintf(f, "bad_offset=0x%llX xor=0x%08X\n",
-                            (unsigned long long)((cbase[c] + h_idx[c]) * 4ULL), h_xor[c]);
+                if (seen[c])
+                    fprintf(f, "bad_offset=0x%llX xor=0x%08X hits=%u state=%s\n",
+                            (unsigned long long)((cbase[c] + h_idx[c]) * 4ULL),
+                            h_xor[c], h_same[c], isbad[c] ? "confirmed" : "unconfirmed");
             fclose(f);
             printf("ready marker : %s\n", ready_file);
         } else {
@@ -323,6 +406,6 @@ int main(int argc, char** argv)
 
     printf("\nsignal received, releasing quarantine.\n");
     if (ready_file) unlink(ready_file);
-    for (int c = 0; c < nchunk; c++) if (isbad[c]) cudaFree(chunk[c]);
+    for (int c = 0; c < nchunk; c++) if (seen[c]) cudaFree(chunk[c]);
     return 0;
 }

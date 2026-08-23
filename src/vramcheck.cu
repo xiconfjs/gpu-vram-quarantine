@@ -114,9 +114,6 @@ int main(int argc, char** argv)
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, dev));
 
-    char serial[64] = "unknown";
-    // nvidia-smi is the only reliable source of board serial; caller logs it too.
-
     size_t freeB = 0, totalB = 0;
     CK(cudaMemGetInfo(&freeB, &totalB));
 

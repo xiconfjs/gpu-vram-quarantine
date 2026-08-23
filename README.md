@@ -48,18 +48,20 @@ Hardcoding would have been wrong.
 
 ## Build
 
-Requires the CUDA toolkit. Set `-arch` for your card (`sm_86` = Ampere/RTX 30xx,
-`sm_89` = Ada/RTX 40xx, `sm_75` = Turing/RTX 20xx).
+Requires the CUDA toolkit (SDK, not just the runtime).
 
 ```bash
-make ARCH=sm_86
+make
 ```
 
-or directly:
+That produces a fat binary with SASS for every architecture from Maxwell to
+Hopper plus PTX, so it runs on newer GPUs via JIT too. You don't need to know
+your compute capability. It takes about ten seconds and costs a few hundred KB.
+
+For a faster single-arch build while developing:
 
 ```bash
-nvcc -O3 -arch=sm_86 -o vramcheck src/vramcheck.cu
-nvcc -O3 -arch=sm_86 -o vrampill  src/vrampill.cu
+make ARCH=sm_86      # or sm_89 for Ada, sm_75 for Turing
 ```
 
 ## Usage
@@ -93,7 +95,23 @@ It holds until killed. Then verify what's left is clean, in another shell:
 | `--find-seconds N` | 1800 | Hard ceiling on the search |
 | `--quiet-seconds N` | 180 | Stop once this long passes with no *new* bad chunk found |
 | `--max-bad N` | 64 | Refuse to continue past this many bad chunks |
+| `--confirm-hits N` | 2 | Repeats at the *same* offset before a chunk counts as confirmed |
 | `--allow-clean` | off | Exit 0 instead of 4 when no fault is found |
+
+### Confirmed vs unconfirmed
+
+A chunk that errors once is a **candidate**, not a fault — a single flip could be a
+transient rather than a stuck cell. A chunk becomes **confirmed** only when the same
+four-byte offset fails `--confirm-hits` times. This requirement came from
+[Olari-A](https://github.com/GpuZelenograd/memtest_vulkan/discussions/89), who
+arrived at the same quarantine design independently and insists that discovery and
+confirmation agree on allocation, offset and bit index.
+
+Where this implementation deliberately diverges: **unconfirmed chunks are still
+quarantined.** Confirmation governs what gets *reported* as established, not what
+gets *held*. Retaining an extra 8 MiB costs nothing; releasing a chunk that turns
+out to be genuinely bad costs silent corruption. Unconfirmed chunks are labelled as
+such in the output and the marker file, and a longer run will usually settle them.
 | `--ready-file P` | — | Write a marker file once quarantine is active |
 
 ### Exit codes
@@ -120,10 +138,27 @@ produced zero errors for the first 143 seconds of load, every time, and then
 errored steadily once hot. A short run on a cold card will pass a broken card.
 This is why `--quiet-seconds` exists and why the defaults are generous.
 
-**It assumes allocation placement is stable while it runs.** The quarantine holds
-physical pages, so it is robust once established. But the search only covers what
-it managed to allocate — anything else holding VRAM hides the region it occupies.
-`vrampill` aborts if it cannot allocate at least 80% of the card.
+**The search only covers what it managed to allocate.** Anything else holding VRAM
+hides the region it occupies. `vrampill` aborts if it cannot allocate at least 80%
+of the card, and reports the coverage it achieved.
+
+**It assumes the driver will not relocate the held allocation.** This is the most
+serious open risk, raised by @galkinvv (memtest_vulkan's author). CUDA on Windows
+can move allocated data within physical memory — VRAM-to-VRAM migration when
+several applications compete for it. If that happened to the held chunk, the
+process would keep its virtual range but stop owning the defective physical page,
+and would go on reporting the quarantine as active while protecting nothing.
+Silent failure of exactly the kind this tool exists to prevent.
+
+Linux CUDA does not appear to do this today, which is why the approach works at
+all. But it is luck rather than design. Two mitigations, neither yet implemented:
+
+- Move the holder onto the **CUDA VMM API** (`cuMemCreate` / `cuMemMap`), which
+  yields an explicit physical allocation handle rather than a relocatable mapping.
+  This is the proper fix.
+- A **watchdog** that periodically re-verifies the fault still reproduces inside
+  the held chunk. If the allocation ever moved, the held chunk would stop failing
+  and the real cell would surface elsewhere — detectable, where today it is not.
 
 **Validated on one card.** One RTX 3090 Founders Edition, one defective cell, one
 driver version (595.71.05, Linux). The multi-cell code path is exercised but has
@@ -205,6 +240,20 @@ Credit to [memtest_vulkan](https://github.com/GpuZelenograd/memtest_vulkan) for
 being the tool that identifies this class of fault in the first place, and for the
 maintainer's clear public explanations of what a single-bit repeating-address
 failure actually means.
+
+Two people materially improved this after it was published, both in
+[discussion #91](https://github.com/GpuZelenograd/memtest_vulkan/discussions/91)
+and [#89](https://github.com/GpuZelenograd/memtest_vulkan/discussions/89):
+
+- **@Olari-A** built the same mechanism independently and contributed the
+  requirement that discovery and confirmation must agree on the same allocation,
+  offset and bit before a quarantine is declared — now `--confirm-hits`.
+- **@galkinvv** identified the allocation-relocation risk documented above, which
+  is the most serious open issue with this approach, and pointed out that a fat
+  binary removes the SDK-and-`-arch` burden from users. He also supplied the
+  physical explanation for the delayed onset: GPUs take 2–5 minutes to reach
+  thermal stabilisation under load, which is why memtest_vulkan's standard test
+  runs for five.
 
 ## License
 
