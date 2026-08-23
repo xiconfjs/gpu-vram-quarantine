@@ -96,7 +96,47 @@ It holds until killed. Then verify what's left is clean, in another shell:
 | `--quiet-seconds N` | 180 | Stop once this long passes with no *new* bad chunk found |
 | `--max-bad N` | 64 | Refuse to continue past this many bad chunks |
 | `--confirm-hits N` | 2 | Repeats at the *same* offset before a chunk counts as confirmed |
+| `--verify-every N` | 300 | Watchdog interval in seconds; `0` disables |
+| `--verify-iters N` | 200 | Sweep iterations per watchdog pass |
+| `--warn-after N` | 3600 | **Hot** seconds with no reproduction before warning |
+| `--hot-c N` | 60 | Temperature at or above which absence of the fault is meaningful |
 | `--allow-clean` | off | Exit 0 instead of 4 when no fault is found |
+| `--ready-file P` | — | Write a marker once the quarantine is active |
+
+Unrecognised arguments are rejected with exit 1 rather than ignored. A silently
+dropped flag on a tool whose failure mode is undetected corruption is not a
+tradeoff worth making.
+
+### Watchdog
+
+Once the quarantine is established, the holder periodically re-runs the sweep
+across only the chunks it holds. If the driver ever relocated the allocation, the
+fault would stop appearing in held memory and resurface in memory handed to
+something else — this is the only way that failure becomes visible from inside the
+process.
+
+The subtlety is that **absence of the fault is not evidence of a problem.** These
+defects are thermally gated: on the card this was built for, the cell fires roughly
+1% of the times it is written at 64 °C under load, and essentially never on an idle
+card. A watchdog that warned on elapsed time alone would fire on every healthy
+quarantine.
+
+So only time spent *hot* counts. Temperature comes from NVML, loaded at runtime
+with `dlopen` so there is no build dependency — if it is unavailable the watchdog
+still runs and still reports reproductions, it just never warns.
+
+```
+[watchdog] fault still inside quarantined memory (3 errors, 64 C)
+[watchdog] no reproduction (53 C, 30s hot so far, last seen 30s ago)
+```
+
+Warnings are warnings, never failures. Even hot, absence is suggestive rather than
+conclusive, and the right response is to re-run a full `vramcheck` rather than to
+assume anything.
+
+The marker file carries the freshness data for external monitoring:
+`verify_passes`, `verify_reproduced`, `last_reproduced_age_s`,
+`hot_secs_without_repro`, `gpu_temp_c`, `temp_source`.
 
 ### Confirmed vs unconfirmed
 
@@ -151,14 +191,13 @@ and would go on reporting the quarantine as active while protecting nothing.
 Silent failure of exactly the kind this tool exists to prevent.
 
 Linux CUDA does not appear to do this today, which is why the approach works at
-all. But it is luck rather than design. Two mitigations, neither yet implemented:
+all. But it is luck rather than design.
 
-- Move the holder onto the **CUDA VMM API** (`cuMemCreate` / `cuMemMap`), which
-  yields an explicit physical allocation handle rather than a relocatable mapping.
-  This is the proper fix.
-- A **watchdog** that periodically re-verifies the fault still reproduces inside
-  the held chunk. If the allocation ever moved, the held chunk would stop failing
-  and the real cell would surface elsewhere — detectable, where today it is not.
+The **watchdog** above is partial mitigation — it makes relocation *detectable*
+rather than silent, though only while the card is hot enough for the fault to be
+firing. The proper fix, not yet implemented, is to move the holder onto the
+**CUDA VMM API** (`cuMemCreate` / `cuMemMap`), which yields an explicit physical
+allocation handle rather than a relocatable mapping.
 
 **Validated on one card.** One RTX 3090 Founders Edition, one defective cell, one
 driver version (595.71.05, Linux). The multi-cell code path is exercised but has

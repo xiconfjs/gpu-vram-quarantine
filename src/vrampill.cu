@@ -40,6 +40,7 @@
 #include <ctime>
 #include <unistd.h>
 #include <csignal>
+#include <dlfcn.h>
 #include <cuda_runtime.h>
 
 #define CK(x) do {                                                            \
@@ -107,6 +108,68 @@ __global__ void kcheck(const unsigned int* p, unsigned long long n,
     }
 }
 
+// Plain error counter for the watchdog. Deliberately separate from kcheck so a
+// verification pass cannot pollute the discovery statistics.
+__global__ void kverify(const unsigned int* p, unsigned long long n,
+                        unsigned long long base, unsigned int pat, int mode,
+                        unsigned int* nerr)
+{
+    unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (; i < n; i += stride)
+        if (p[i] != genval(base + i, pat, mode)) atomicAdd(nerr, 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Optional GPU temperature, via NVML loaded at runtime.
+//
+// Deliberately dlopen'd rather than linked: nvml.h is not reliably present with
+// the CUDA toolkit, and requiring it would undo the point of shipping a binary
+// that builds with a bare `make`. If the library is missing we simply lose
+// temperature gating and say so.
+//
+// Why the watchdog needs temperature at all: these faults are thermally gated.
+// On an idle card a small held region may never fail even though the defect is
+// still very much there. Counting elapsed wall-clock time toward a warning
+// would therefore fire on every healthy quarantine. Only time spent *hot*
+// without a reproduction is evidence of anything.
+// ---------------------------------------------------------------------------
+typedef int (*nvml_init_t)(void);
+typedef int (*nvml_bybus_t)(const char*, void**);
+typedef int (*nvml_temp_t)(void*, int, unsigned int*);
+
+static void*        g_nvml_lib  = NULL;
+static nvml_temp_t  g_nvml_temp = NULL;
+static void*        g_nvml_dev  = NULL;
+
+static void nvml_try_open(const cudaDeviceProp& prop)
+{
+    g_nvml_lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+    if (!g_nvml_lib) g_nvml_lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
+    if (!g_nvml_lib) return;
+
+    nvml_init_t  init  = (nvml_init_t)dlsym(g_nvml_lib, "nvmlInit_v2");
+    nvml_bybus_t bybus = (nvml_bybus_t)dlsym(g_nvml_lib, "nvmlDeviceGetHandleByPciBusId_v2");
+    g_nvml_temp        = (nvml_temp_t)dlsym(g_nvml_lib, "nvmlDeviceGetTemperature");
+    if (!init || !bybus || !g_nvml_temp) { g_nvml_temp = NULL; return; }
+    if (init() != 0) { g_nvml_temp = NULL; return; }
+
+    // Resolve by PCI address, because CUDA and NVML device orderings differ.
+    char bus[32];
+    snprintf(bus, sizeof(bus), "%08X:%02X:%02X.0",
+             prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    if (bybus(bus, &g_nvml_dev) != 0) { g_nvml_temp = NULL; g_nvml_dev = NULL; }
+}
+
+// Returns degrees C, or -1 if unavailable.
+static int gpu_temp_c(void)
+{
+    if (!g_nvml_temp || !g_nvml_dev) return -1;
+    unsigned int t = 0;
+    if (g_nvml_temp(g_nvml_dev, 0 /* NVML_TEMPERATURE_GPU */, &t) != 0) return -1;
+    return (int)t;
+}
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int) { g_stop = 1; }
 
@@ -126,6 +189,10 @@ int main(int argc, char** argv)
     int    max_bad     = 64;
     int    allow_clean = 0;
     int    confirm_hits = 2;   // repeats at the same offset before "confirmed"
+    double verify_every = 300.0;   // seconds between watchdog passes; 0 disables
+    int    verify_iters = 200;     // sweep iterations per watchdog pass
+    double warn_after   = 3600.0;  // HOT seconds without reproduction before warning
+    int    hot_c        = 60;      // at or above this, absence of the fault is meaningful
     const char* ready_file = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -135,8 +202,35 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--quiet-seconds") && i + 1 < argc) quiet_secs = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max-bad") && i + 1 < argc) max_bad = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--confirm-hits") && i + 1 < argc) confirm_hits = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--verify-every") && i + 1 < argc) verify_every = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--verify-iters") && i + 1 < argc) verify_iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--warn-after") && i + 1 < argc) warn_after = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--hot-c") && i + 1 < argc) hot_c = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--allow-clean")) allow_clean = 1;
         else if (!strcmp(argv[i], "--ready-file") && i + 1 < argc) ready_file = argv[++i];
+        else {
+            // Reject rather than ignore. A silently dropped flag on a tool whose
+            // failure mode is undetected memory corruption is not acceptable.
+            if (strcmp(argv[i], "--help") && strcmp(argv[i], "-h"))
+                printf("unrecognised or incomplete argument: %s\n\n", argv[i]);
+            printf(
+                "vrampill - quarantine defective VRAM cells so the rest of the card stays usable\n\n"
+                "  --device N          CUDA device index (default 0)\n"
+                "  --chunk-mib N       quarantine granularity in MiB (default 8)\n"
+                "  --find-seconds N    hard ceiling on the search (default 1800)\n"
+                "  --quiet-seconds N   stop after this long with nothing new (default 180)\n"
+                "  --confirm-hits N    repeats at one offset before confirming (default 2)\n"
+                "  --max-bad N         refuse to continue past this many bad chunks (default 64)\n"
+                "  --verify-every N    watchdog interval in seconds, 0 disables (default 300)\n"
+                "  --verify-iters N    sweep iterations per watchdog pass (default 200)\n"
+                "  --warn-after N      HOT seconds without reproduction before warning (default 3600)\n"
+                "  --hot-c N           temperature at or above which absence is meaningful (default 60)\n"
+                "  --allow-clean       exit 0 instead of 4 when no fault is found\n"
+                "  --ready-file PATH   write a marker once the quarantine is active\n\n"
+                "Exit codes: 0 active, 2 CUDA error, 3 insufficient VRAM,\n"
+                "            4 no fault found (NOT a pass), 5 too many bad chunks\n");
+            return (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) ? 0 : 1;
+        }
     }
     if (ready_file) unlink(ready_file);
 
@@ -380,32 +474,126 @@ int main(int argc, char** argv)
                "That may be a transient rather than a stuck cell. They are quarantined\n"
                "regardless, but a longer run would settle it.\n");
 
-    if (ready_file) {
+    // ---- watchdog state -------------------------------------------------
+    // The quarantine was just established from a live fault, so "last
+    // reproduced" starts now.
+    time_t last_repro = time(NULL);
+    unsigned long long verify_passes = 0, verify_reproduced = 0;
+    double hot_secs_no_repro = 0.0;   // only time spent hot counts toward a warning
+
+    nvml_try_open(prop);
+    int have_temp = (gpu_temp_c() >= 0);
+
+    auto write_marker = [&]() {
+        if (!ready_file) return;
         FILE* f = fopen(ready_file, "w");
-        if (f) {
-            fprintf(f, "status=active\ndevice=%d\nchunk_mib=%zu\n"
-                       "confirmed_chunks=%d\nunconfirmed_chunks=%d\nheld_chunks=%d\n"
-                       "held_mib=%.1f\nconfirm_hits=%d\n",
-                    dev, chunk_mib, nbad, nunconf, nseen,
-                    held / 1048576.0, confirm_hits);
-            for (int c = 0; c < nchunk; c++)
-                if (seen[c])
-                    fprintf(f, "bad_offset=0x%llX xor=0x%08X hits=%u state=%s\n",
-                            (unsigned long long)((cbase[c] + h_idx[c]) * 4ULL),
-                            h_xor[c], h_same[c], isbad[c] ? "confirmed" : "unconfirmed");
-            fclose(f);
-            printf("ready marker : %s\n", ready_file);
-        } else {
-            printf("WARNING: could not write ready marker %s\n", ready_file);
-        }
+        if (!f) { printf("WARNING: could not write ready marker %s\n", ready_file); return; }
+        fprintf(f, "status=active\ndevice=%d\nchunk_mib=%zu\n"
+                   "confirmed_chunks=%d\nunconfirmed_chunks=%d\nheld_chunks=%d\n"
+                   "held_mib=%.1f\nconfirm_hits=%d\n",
+                dev, chunk_mib, nbad, nunconf, nseen,
+                held / 1048576.0, confirm_hits);
+        fprintf(f, "verify_passes=%llu\nverify_reproduced=%llu\n"
+                   "last_reproduced_unix=%lld\nlast_reproduced_age_s=%lld\n"
+                   "hot_secs_without_repro=%.0f\nhot_threshold_c=%d\n"
+                   "gpu_temp_c=%d\ntemp_source=%s\n",
+                verify_passes, verify_reproduced,
+                (long long)last_repro, (long long)(time(NULL) - last_repro),
+                hot_secs_no_repro, hot_c, gpu_temp_c(),
+                have_temp ? "nvml" : "unavailable");
+        for (int c = 0; c < nchunk; c++)
+            if (seen[c])
+                fprintf(f, "bad_offset=0x%llX xor=0x%08X hits=%u state=%s\n",
+                        (unsigned long long)((cbase[c] + h_idx[c]) * 4ULL),
+                        h_xor[c], h_same[c], isbad[c] ? "confirmed" : "unconfirmed");
+        fclose(f);
+    };
+
+    write_marker();
+    if (ready_file) printf("ready marker : %s\n", ready_file);
+
+    if (verify_every > 0) {
+        printf("watchdog     : re-checking held memory every %.0fs\n", verify_every);
+        if (have_temp)
+            printf("               warns after %.0fs at >=%d C with no reproduction\n",
+                   warn_after, hot_c);
+        else
+            printf("               NVML unavailable, no temperature gating — absence of\n"
+                   "               the fault on an idle card is normal and not reported\n");
     }
     printf("\nHolding until killed. Verify the rest of the card separately.\n");
     fflush(stdout);
 
-    while (!g_stop) sleep(2);
+    unsigned int* d_verr = NULL;
+    CK(cudaMalloc(&d_verr, sizeof(unsigned int)));
+
+    double next_verify = now_s() + verify_every;
+
+    while (!g_stop) {
+        sleep(2);
+        if (verify_every <= 0 || now_s() < next_verify) continue;
+        next_verify = now_s() + verify_every;
+
+        // Re-run the sweep across only the held chunks. If the driver ever
+        // relocated this allocation, we would still own the virtual range but
+        // no longer the defective physical page — and the fault would stop
+        // appearing here while reappearing in memory handed to someone else.
+        unsigned int total = 0;
+        for (int it = 0; it < verify_iters && !g_stop; it++) {
+            unsigned int pat  = pats[it % npat];
+            int          mode = (it / npat) % 3;
+            for (int c = 0; c < nchunk; c++)
+                if (seen[c]) kfill<<<blocks, threads>>>(chunk[c], celems[c], cbase[c], pat, mode);
+            CK(cudaDeviceSynchronize());
+            CK(cudaMemset(d_verr, 0, sizeof(unsigned int)));
+            for (int c = 0; c < nchunk; c++)
+                if (seen[c]) kverify<<<blocks, threads>>>(chunk[c], celems[c], cbase[c],
+                                                          pat, mode, d_verr);
+            CK(cudaDeviceSynchronize());
+            unsigned int e = 0;
+            CK(cudaMemcpy(&e, d_verr, sizeof(e), cudaMemcpyDeviceToHost));
+            total += e;
+        }
+        verify_passes++;
+
+        int temp = gpu_temp_c();
+
+        if (total) {
+            verify_reproduced++;
+            last_repro = time(NULL);
+            hot_secs_no_repro = 0.0;
+            printf("[watchdog] fault still inside quarantined memory (%u errors, %d C)\n",
+                   total, temp);
+        } else {
+            // Only accumulate time the card was actually hot. A cool card not
+            // reproducing a thermally-gated fault is expected, and counting that
+            // toward a warning would fire on every healthy quarantine.
+            if (have_temp && temp >= hot_c) hot_secs_no_repro += verify_every;
+
+            long long age = (long long)(time(NULL) - last_repro);
+            if (have_temp && hot_secs_no_repro > warn_after) {
+                // Still a warning rather than a failure: even hot, absence is
+                // suggestive rather than conclusive.
+                printf("[watchdog] WARNING: %.0fs at >=%d C with no reproduction in held\n"
+                       "           memory (currently %d C, last seen %llds ago). Either the\n"
+                       "           cell has changed behaviour or this allocation no longer\n"
+                       "           covers the defect. Re-run a full vramcheck to find out.\n",
+                       hot_secs_no_repro, hot_c, temp, age);
+            } else if (have_temp) {
+                printf("[watchdog] no reproduction (%d C, %.0fs hot so far, last seen %llds ago)\n",
+                       temp, hot_secs_no_repro, age);
+            } else {
+                printf("[watchdog] no reproduction (last seen %llds ago, no temperature data)\n",
+                       age);
+            }
+        }
+        write_marker();
+        fflush(stdout);
+    }
 
     printf("\nsignal received, releasing quarantine.\n");
     if (ready_file) unlink(ready_file);
+    cudaFree(d_verr);
     for (int c = 0; c < nchunk; c++) if (seen[c]) cudaFree(chunk[c]);
     return 0;
 }
