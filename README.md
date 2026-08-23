@@ -167,9 +167,18 @@ errors at a repeating address suffix; independently reproduced here.
 | Errors found | 1,866 — **all at one address, all the same bit** |
 | Distinct bad cells | 1 |
 | Controls | Two healthy RTX 3090s, same host, same run: 0 errors over ~456 TiB each |
-| Usable VRAM, naive cap | 20.00 GiB |
-| Usable VRAM, quarantined | 22.8 GiB (holding 8 MiB) |
 | Verification with quarantine active | 15,877 iterations, 342.6 TiB, peak 64 °C, **0 errors** |
+
+How much of the card you keep:
+
+| | Usable | vs a healthy card |
+|---|---:|---:|
+| Healthy RTX 3090, same host | 24,117 MiB | 100% |
+| **Quarantined** | **23,853 MiB** | **98.9%** |
+| Naive allocation cap below the fault | 20,480 MiB | 84.9% |
+
+The quarantine itself is 8 MiB. The rest of the 264 MiB cost is the holder
+process's CUDA context, which is unavoidable for any process that touches CUDA.
 
 The 64 °C matters: that is the temperature at which this card fails constantly
 without the quarantine.
